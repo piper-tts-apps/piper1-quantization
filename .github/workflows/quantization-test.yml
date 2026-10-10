@@ -11,6 +11,8 @@ env:
   MODEL_URL: https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
   # Minimum required size reduction: original >= 1.5 x quantized
   MIN_RATIO: "1.5"
+  # Minimum required size reduction for INT8: original >= 2.5 x int8
+  MIN_INT8_RATIO: "2.5"
 
 jobs:
   test-quantization:
@@ -99,9 +101,71 @@ jobs:
           assert frames > 0, "test.wav contains no audio frames"
           EOF
 
+      - name: Run the quantization script (INT8)
+        run: |
+          python quantize.py --mode int8 original.onnx quantized_int8.onnx
+          cp original.onnx.json quantized_int8.onnx.json
+          ls -lh quantized_int8.onnx
+
+      - name: Check the INT8 model is at least 2.5x smaller and beats FP16
+        run: |
+          python - <<'EOF'
+          import os
+
+          min_ratio = float(os.environ["MIN_INT8_RATIO"])
+          original = os.path.getsize("original.onnx")
+          fp16 = os.path.getsize("quantized.onnx")
+          int8 = os.path.getsize("quantized_int8.onnx")
+          ratio = original / int8
+          print(f"Original: {original:,} bytes")
+          print(f"FP16:     {fp16:,} bytes")
+          print(f"INT8:     {int8:,} bytes")
+          print(f"INT8 reduction: {ratio:.2f}x (required: >= {min_ratio}x)")
+          assert ratio >= min_ratio, (
+              f"INT8 model is only {ratio:.2f}x smaller, "
+              f"expected at least {min_ratio}x"
+          )
+          assert int8 < fp16, "INT8 model is not smaller than the FP16 model"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  f"- INT8: {int8:,} bytes\n"
+                  f"- INT8 reduction: **{ratio:.2f}x** "
+                  f"(required >= {min_ratio}x), "
+                  f"{100 * (1 - int8 / fp16):.1f}% smaller than FP16\n"
+              )
+          EOF
+
+      - name: Generate audio with the INT8 model
+        run: |
+          # Reuses the piper-tts venv created for the FP16 audio step.
+          echo "Hello world, this is a test of the quantized Piper model." \
+            | /tmp/piper-venv/bin/piper --model quantized_int8.onnx --output_file test_int8.wav
+          ls -lh test_int8.wav
+
+      - name: Check the INT8 audio is not empty
+        run: |
+          python - <<'EOF'
+          import os
+          import wave
+
+          path = "test_int8.wav"
+          assert os.path.isfile(path), "test_int8.wav was not generated"
+          size = os.path.getsize(path)
+          print(f"test_int8.wav: {size:,} bytes")
+          assert size > 44, f"test_int8.wav is empty (only {size} bytes)"
+          with wave.open(path) as wav:
+              frames = wav.getnframes()
+              rate = wav.getframerate()
+          print(f"Frames: {frames}, sample rate: {rate}, "
+                f"duration: {frames / rate:.2f}s")
+          assert frames > 0, "test_int8.wav contains no audio frames"
+          EOF
+
       - name: Upload the generated audio
         uses: actions/upload-artifact@v4
         with:
           name: quantized-test-audio
-          path: test.wav
+          path: |
+            test.wav
+            test_int8.wav
           if-no-files-found: error

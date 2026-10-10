@@ -1,9 +1,16 @@
 [project]
 name = "piper1-quantization"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = "==3.12.*"
 dependencies = [
     "onnxconverter_common==1.14.0",
     "onnx==1.16.1",
-    "numpy<2.0.0"
+    "numpy<2.0.0",
+    # Only needed for INT8 mode (quantize.py imports onnxruntime lazily).
+    # Pinned to the versions the INT8 conversion is tested with:
+    # onnxruntime's quantization module also needs sympy, and newer
+    # onnxruntime releases pull in ml_dtypes for the quantization tools.
+    "onnxruntime==1.26.0",
+    "sympy==1.14.0",
+    "ml_dtypes==0.5.4"
 ]
