@@ -1,0 +1,107 @@
+name: Quantization test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # A stock FP32 Piper voice to test against. Change this one line to
+  # test a different voice.
+  MODEL_URL: https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+  # Minimum required size reduction: original >= 1.5 x quantized
+  MIN_RATIO: "1.5"
+
+jobs:
+  test-quantization:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the quantizer
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the quantizer
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Download the original model
+        run: |
+          curl -fL -o original.onnx "$MODEL_URL"
+          curl -fL -o original.onnx.json "${MODEL_URL}.json"
+          ls -lh original.onnx original.onnx.json
+
+      - name: Run the quantization script
+        run: |
+          python quantize.py original.onnx quantized.onnx
+          # Piper expects the voice config next to the model as <model>.json
+          cp original.onnx.json quantized.onnx.json
+          ls -lh quantized.onnx
+
+      - name: Check the quantized model is at least 1.5x smaller
+        run: |
+          python - <<'EOF'
+          import os
+
+          min_ratio = float(os.environ["MIN_RATIO"])
+          original = os.path.getsize("original.onnx")
+          quantized = os.path.getsize("quantized.onnx")
+          ratio = original / quantized
+          print(f"Original:  {original:,} bytes")
+          print(f"Quantized: {quantized:,} bytes")
+          print(f"Reduction: {ratio:.2f}x (required: >= {min_ratio}x)")
+          assert ratio >= min_ratio, (
+              f"Quantized model is only {ratio:.2f}x smaller, "
+              f"expected at least {min_ratio}x"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  f"## Quantization test\n\n"
+                  f"- Original: {original:,} bytes\n"
+                  f"- Quantized: {quantized:,} bytes\n"
+                  f"- Reduction: **{ratio:.2f}x** (required >= {min_ratio}x)\n"
+              )
+          EOF
+
+      - name: Generate audio with the quantized model
+        run: |
+          # piper-tts goes in its own venv: its dependencies conflict with
+          # the quantizer's pinned onnx / protobuf versions, and the two
+          # tools never need to share an environment.
+          python -m venv /tmp/piper-venv
+          /tmp/piper-venv/bin/pip install --quiet piper-tts==1.8.0
+          echo "Hello world, this is a test of the quantized Piper model." \
+            | /tmp/piper-venv/bin/piper --model quantized.onnx --output_file test.wav
+          ls -lh test.wav
+
+      - name: Check the generated audio is not empty
+        run: |
+          python - <<'EOF'
+          import os
+          import wave
+
+          path = "test.wav"
+          assert os.path.isfile(path), "test.wav was not generated"
+          size = os.path.getsize(path)
+          print(f"test.wav: {size:,} bytes")
+          # A WAV header alone is 44 bytes; real audio must be larger
+          # and must contain actual frames.
+          assert size > 44, f"test.wav is empty (only {size} bytes)"
+          with wave.open(path) as wav:
+              frames = wav.getnframes()
+              rate = wav.getframerate()
+          print(f"Frames: {frames}, sample rate: {rate}, "
+                f"duration: {frames / rate:.2f}s")
+          assert frames > 0, "test.wav contains no audio frames"
+          EOF
+
+      - name: Upload the generated audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantized-test-audio
+          path: test.wav
+          if-no-files-found: error
